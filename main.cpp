@@ -12,6 +12,7 @@
 #include "MyGL/PickVertex.h"
 
 #include <iostream>
+#include <format>
 
 glm::vec3 eigen_to_glm_vec3d(Eigen::Vector3d v)
 {
@@ -51,23 +52,88 @@ struct MeshConverter
 class ImGuiLog
 {
 public:
-    void log(const std::string &entry)
+    ImGuiLog() : auto_scroll(true), scroll_to_bottom(false) {}
+
+    void Clear()
     {
-        log_entries.push_back(entry);
+        items.clear();
     }
 
-    void show_log_window()
+    template <typename... Args>
+    void log(std::string_view fmt, Args &&...args)
     {
-        ImGui::Begin("Log");
+        std::string message = std::vformat(fmt, std::make_format_args(args...));
+        items.push_back(std::move(message));
+        if (auto_scroll)
+            scroll_to_bottom = true;
+    }
 
-        for (const auto &entry : log_entries)
-            ImGui::Text("%s", entry.c_str());
+    void log(const std::string &msg)
+    {
+        log("{}", msg);
+    }
 
+    void draw(const char *title = "Log", bool *p_open = nullptr)
+    {
+        ImGui::SetNextWindowSize(ImVec2(500, 400), ImGuiCond_FirstUseEver);
+        ImGui::Begin(title, p_open);
+
+        // Options menu
+        if (ImGui::BeginPopup("Options"))
+        {
+            ImGui::Checkbox("Auto-scroll", &auto_scroll);
+            ImGui::EndPopup();
+        }
+
+        // Main window
+        if (ImGui::Button("Options"))
+            ImGui::OpenPopup("Options");
+        ImGui::SameLine();
+        bool should_clear = ImGui::Button("Clear");
+        ImGui::SameLine();
+        bool should_copy = ImGui::Button("Copy");
+        ImGui::SameLine();
+        filter.Draw("Filter", -100.0f);
+
+        ImGui::Separator();
+
+        ImGui::BeginChild("scrolling", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+
+        if (should_clear)
+            Clear();
+        if (should_copy)
+            ImGui::LogToClipboard();
+
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
+        for (const auto &item : items)
+        {
+            if (!filter.PassFilter(item.c_str()))
+                continue;
+            ImGui::TextUnformatted(item.c_str());
+        }
+        ImGui::PopStyleVar();
+
+        // Scroll to bottom if needed
+        if (scroll_to_bottom && was_at_bottom)
+        {
+            scroll_to_bottom = false;
+            ImGui::SetScrollHereY(1.0f);
+        }
+        was_at_bottom = ImGui::GetScrollMaxY() - ImGui::GetScrollY() < scroll_tolerance;
+
+        ImGui::EndChild();
         ImGui::End();
     }
 
 private:
-    std::vector<std::string> log_entries;
+    std::vector<std::string> items;
+    ImGuiTextFilter filter;
+    bool auto_scroll;
+
+    // Scroll to bottom variables
+    bool scroll_to_bottom;
+    bool was_at_bottom = true;
+    const float scroll_tolerance = 1.0f;
 };
 
 class SelectCut
@@ -170,12 +236,12 @@ private:
     bool is_closed = false;
 };
 
+ImGuiLog log;
+
 int main()
 {
     // Initialize window (and OpenGL context)
-    MyGL::Window window(1500, 1000, "Cross Field Visualization");
-    float last_frame_time = 0.0f;
-    float delta_time = 0.0f;
+    MyGL::Window window(1500, 1000, "Optimal Boundary for Poisson Mesh Merging");
 
     // Load shader from file
     MyGL::ShaderProgram basic;
@@ -202,15 +268,11 @@ int main()
         exit(EXIT_FAILURE);
     }
 
-    // Resize the mesh to [-1, 1]^3
-    auto resize_mesh = [](Mesh &mesh)
+    // Fit the mesh to the unit cube [-1, 1]^3
+    auto fit_mesh = [](Mesh &mesh)
     {
-        Eigen::Vector3d min_point(std::numeric_limits<double>::infinity(),
-                                  std::numeric_limits<double>::infinity(),
-                                  std::numeric_limits<double>::infinity());
-        Eigen::Vector3d max_point(-std::numeric_limits<double>::infinity(),
-                                  -std::numeric_limits<double>::infinity(),
-                                  -std::numeric_limits<double>::infinity());
+        Eigen::Vector3d min_point = Eigen::Vector3d::Ones() * std::numeric_limits<double>::infinity();
+        Eigen::Vector3d max_point = -Eigen::Vector3d::Ones() * std::numeric_limits<double>::infinity();
         for (const auto &v : mesh.vertices())
         {
             auto point = mesh.point(v);
@@ -232,8 +294,8 @@ int main()
             mesh.set_point(v, point);
         }
     };
-    resize_mesh(source_mesh);
-    resize_mesh(target_mesh);
+    fit_mesh(source_mesh);
+    fit_mesh(target_mesh);
 
     // Convert mesh to MyGL::Mesh
     MeshConverter src_conv(source_mesh), tgt_conv(target_mesh);
@@ -247,8 +309,6 @@ int main()
 
     // Some utility classes
     MyGL::PickVertex pick_vertex;
-
-    ImGuiLog log;
 
     auto io = ImGui::GetIO();
 
@@ -285,6 +345,9 @@ int main()
 
     // Main loop 1 (selecting boundaries)
     // ==================================================
+    float last_frame_time = 0.0f;
+    float delta_time = 0.0f;
+
     while (!window.should_close())
     {
         if (status.load_boundary_from_file)
@@ -405,11 +468,11 @@ int main()
                 if (!io.WantCaptureMouse && ImGui::IsMouseClicked(0)) // 0 is the left mouse button
                 {
                     ImVec2 mouse_pos = ImGui::GetMousePos();
-                    log.log("Mouse clicked at (" + std::to_string(mouse_pos.x) + ", " + std::to_string(mouse_pos.y) + ")");
+                    log.log("Mouse clicked at ({}, {})", mouse_pos.x, mouse_pos.y);
 
                     auto [width, height] = window.get_framebuffer_size();
                     int index = pick_vertex.pick_vertex(mouse_pos.x, height - mouse_pos.y, gl_mesh, mvp);
-                    log.log("Selected vertex " + std::to_string(index));
+                    log.log("Selected vertex {}", index);
 
                     if (index >= 0) // -1 means no vertex is selected
                     {
@@ -462,7 +525,7 @@ int main()
 
         ImGui::End();
 
-        log.show_log_window();
+        log.draw();
 
         ImGui::Render();
 
@@ -486,7 +549,6 @@ int main()
     //     seam_file << std::endl;
     // }
 
-    std::vector<Mesh::VertexHandle> src_seam, feat_seam, tgt_seam;
     if (status.load_boundary_from_file)
     {
         // load the selected vertices from a file
@@ -500,16 +562,9 @@ int main()
             while (iss >> v_idx)
                 vertices.push_back(source_mesh.vertex_handle(v_idx));
         };
-        read_a_line(src_seam);
-        read_a_line(feat_seam);
-        read_a_line(tgt_seam);
-    }
-
-    if (status.load_boundary_from_file)
-    {
-        cut_src.seam_vertices = src_seam;
-        cut_feat.seam_vertices = feat_seam;
-        cut_tgt.seam_vertices = tgt_seam;
+        read_a_line(cut_src.seam_vertices);
+        read_a_line(cut_feat.seam_vertices);
+        read_a_line(cut_tgt.seam_vertices);
     }
 
     OptimalBoundaries ob(source_mesh, target_mesh,
@@ -520,7 +575,7 @@ int main()
     // OpenMesh::IO::write_mesh(ob.get_band_filled(), "data/models/band_filled.obj");
     // OpenMesh::IO::write_mesh(ob.get_stripe(), "data/models/stripe.obj");
 
-    auto gen_uv_mesh = [&](const Mesh &mesh, Eigen::MatrixXd &uv)
+    auto gen_uv_glmesh = [](const Mesh &mesh, Eigen::MatrixX2d &uv)
     {
         auto conv = MeshConverter(mesh);
         std::vector<glm::vec3> verticecs_uv(mesh.n_vertices());
@@ -530,12 +585,12 @@ int main()
     };
 
     Mesh band = ob.get_band();
-    auto band_uv = ob.get_band_uv();
-    MyGL::Mesh gl_band = gen_uv_mesh(band, band_uv);
+    Eigen::MatrixX2d band_uv = ob.get_band_uv();
+    MyGL::Mesh gl_band = gen_uv_glmesh(band, band_uv);
 
     Mesh disk = ob.get_disk();
-    auto disk_uv = ob.get_disk_uv();
-    MyGL::Mesh gl_disk = gen_uv_mesh(disk, disk_uv);
+    Eigen::MatrixX2d disk_uv = ob.get_disk_uv();
+    MyGL::Mesh gl_disk = gen_uv_glmesh(disk, disk_uv);
 
     struct
     {
@@ -623,7 +678,7 @@ int main()
 
         ImGui::End();
 
-        log.show_log_window();
+        log.draw();
 
         ImGui::Render();
 
