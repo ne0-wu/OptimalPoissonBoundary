@@ -40,10 +40,9 @@ void Dijkstra::run()
         if (fr == target)
             break;
 
-        for (const auto &he : mesh.voh_range(fr))
+        for (const auto &to : mesh.vv_range(fr))
         {
-            const auto to = he.to();
-            const auto w = edge_weight[he.edge()];
+            const auto w = edge_weight[mesh.find_halfedge(fr, to).edge()];
 
             if (distance[to] > distance[fr] + w)
             {

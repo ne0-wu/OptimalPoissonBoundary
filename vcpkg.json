@@ -1,0 +1,16 @@
+{
+    "dependencies": [
+        "eigen3",
+        "openmesh",
+        "glad",
+        "glm",
+        "glfw3",
+        {
+            "name": "imgui",
+            "features": [
+                "opengl3-binding",
+                "glfw-binding"
+            ]
+        }
+    ]
+}

@@ -10,9 +10,9 @@
 #include "MyGL/PointCloud.h"
 #include "MyGL/Shader.h"
 #include "MyGL/PickVertex.h"
+#include "MyGL/LogConsole.h"
 
 #include <iostream>
-#include <format>
 
 glm::vec3 eigen_to_glm_vec3d(Eigen::Vector3d v)
 {
@@ -49,97 +49,11 @@ struct MeshConverter
     std::vector<GLuint> indices;
 };
 
-class ImGuiLog
+// This class is used to select a closed path on a mesh
+class MeshClosedPath
 {
 public:
-    ImGuiLog() : auto_scroll(true), scroll_to_bottom(false) {}
-
-    void Clear()
-    {
-        items.clear();
-    }
-
-    template <typename... Args>
-    void log(std::string_view fmt, Args &&...args)
-    {
-        std::string message = std::vformat(fmt, std::make_format_args(args...));
-        items.push_back(std::move(message));
-        if (auto_scroll)
-            scroll_to_bottom = true;
-    }
-
-    void log(const std::string &msg)
-    {
-        log("{}", msg);
-    }
-
-    void draw(const char *title = "Log", bool *p_open = nullptr)
-    {
-        ImGui::SetNextWindowSize(ImVec2(500, 400), ImGuiCond_FirstUseEver);
-        ImGui::Begin(title, p_open);
-
-        // Options menu
-        if (ImGui::BeginPopup("Options"))
-        {
-            ImGui::Checkbox("Auto-scroll", &auto_scroll);
-            ImGui::EndPopup();
-        }
-
-        // Main window
-        if (ImGui::Button("Options"))
-            ImGui::OpenPopup("Options");
-        ImGui::SameLine();
-        bool should_clear = ImGui::Button("Clear");
-        ImGui::SameLine();
-        bool should_copy = ImGui::Button("Copy");
-        ImGui::SameLine();
-        filter.Draw("Filter", -100.0f);
-
-        ImGui::Separator();
-
-        ImGui::BeginChild("scrolling", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
-
-        if (should_clear)
-            Clear();
-        if (should_copy)
-            ImGui::LogToClipboard();
-
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
-        for (const auto &item : items)
-        {
-            if (!filter.PassFilter(item.c_str()))
-                continue;
-            ImGui::TextUnformatted(item.c_str());
-        }
-        ImGui::PopStyleVar();
-
-        // Scroll to bottom if needed
-        if (scroll_to_bottom && was_at_bottom)
-        {
-            scroll_to_bottom = false;
-            ImGui::SetScrollHereY(1.0f);
-        }
-        was_at_bottom = ImGui::GetScrollMaxY() - ImGui::GetScrollY() < scroll_tolerance;
-
-        ImGui::EndChild();
-        ImGui::End();
-    }
-
-private:
-    std::vector<std::string> items;
-    ImGuiTextFilter filter;
-    bool auto_scroll;
-
-    // Scroll to bottom variables
-    bool scroll_to_bottom;
-    bool was_at_bottom = true;
-    const float scroll_tolerance = 1.0f;
-};
-
-class SelectCut
-{
-public:
-    SelectCut(const Mesh &mesh) : mesh(mesh), edge_length(mesh), is_selected(false, mesh)
+    MeshClosedPath(const Mesh &mesh) : mesh(mesh), edge_length(mesh), is_selected(false, mesh)
     {
         for (const auto &e : mesh.edges())
             edge_length[e] = mesh.calc_edge_length(e);
@@ -151,16 +65,16 @@ public:
             return false;
 
         // If the seam is empty, add the vertex directly
-        if (seam_vertices.empty())
+        if (vertices.empty())
         {
             is_selected[vertex] = true;
-            seam_vertices.push_back(vertex);
-            seam_points.push_back(eigen_to_glm_vec3d(mesh.point(vertex)));
+            vertices.push_back(vertex);
+            points.push_back(eigen_to_glm_vec3d(mesh.point(vertex)));
             return true;
         }
 
         // Run Dijkstra's algorithm to find the shortest path from the last vertex to the new vertex
-        auto start = seam_vertices.back();
+        auto start = vertices.back();
         Dijkstra dijkstra(mesh, start, vertex, edge_length);
         dijkstra.run();
         if (dijkstra.get_distance(vertex) == std::numeric_limits<double>::infinity())
@@ -171,48 +85,48 @@ public:
             if (is_selected[v])
                 return false;
 
-        int num_seam_old = seam_vertices.size();
+        int num_seam_old = vertices.size();
         for (Mesh::VertexHandle v = vertex; v != start; v = dijkstra.get_previous(v))
-            seam_vertices.push_back(v);
-        std::reverse(seam_vertices.begin() + num_seam_old, seam_vertices.end());
+            vertices.push_back(v);
+        std::reverse(vertices.begin() + num_seam_old, vertices.end());
 
-        for (auto v = seam_vertices.begin() + num_seam_old; v != seam_vertices.end(); ++v)
+        for (auto v = vertices.begin() + num_seam_old; v != vertices.end(); ++v)
         {
             is_selected[*v] = true;
-            seam_points.push_back(eigen_to_glm_vec3d(mesh.point(*v)));
+            points.push_back(eigen_to_glm_vec3d(mesh.point(*v)));
         }
 
         return true;
     }
 
-    bool close_seam()
+    bool close_path()
     {
-        if (seam_vertices.empty())
+        if (vertices.empty())
             return false;
 
-        auto start = seam_vertices.back();
-        auto end = seam_vertices.front();
+        auto start = vertices.back();
+        auto end = vertices.front();
         Dijkstra dijkstra(mesh, start, end, edge_length);
         dijkstra.run();
         if (dijkstra.get_distance(end) == std::numeric_limits<double>::infinity() ||
-            dijkstra.get_previous(end) == seam_vertices[1])
+            dijkstra.get_previous(end) == vertices[1])
             return false;
 
-        int num_seam_old = seam_vertices.size();
+        int num_seam_old = vertices.size();
         for (Mesh::VertexHandle v = end; v != start; v = dijkstra.get_previous(v))
-            seam_vertices.push_back(v);
-        std::reverse(seam_vertices.begin() + num_seam_old, seam_vertices.end());
-        seam_vertices.resize(seam_vertices.size() - 1); // remove the redundant end vertex
+            vertices.push_back(v);
+        std::reverse(vertices.begin() + num_seam_old, vertices.end());
+        vertices.resize(vertices.size() - 1); // remove the redundant end vertex
 
-        for (auto v = seam_vertices.begin() + num_seam_old; v != seam_vertices.end(); ++v)
-            seam_points.push_back(eigen_to_glm_vec3d(mesh.point(*v)));
+        for (auto v = vertices.begin() + num_seam_old; v != vertices.end(); ++v)
+            points.push_back(eigen_to_glm_vec3d(mesh.point(*v)));
 
         is_closed = true;
 
         return true;
     }
 
-    bool is_seam_closed() const
+    bool is_path_closed() const
     {
         return is_closed;
     }
@@ -220,13 +134,13 @@ public:
     std::string vertices_to_string() const
     {
         std::string result;
-        for (const auto &v : seam_vertices)
+        for (const auto &v : vertices)
             result += std::to_string(v.idx()) + " ";
         return result;
     }
 
-    std::vector<Mesh::VertexHandle> seam_vertices;
-    std::vector<glm::vec3> seam_points;
+    std::vector<Mesh::VertexHandle> vertices;
+    std::vector<glm::vec3> points;
 
 private:
     const Mesh &mesh;
@@ -236,10 +150,22 @@ private:
     bool is_closed = false;
 };
 
-ImGuiLog log;
+MyGL::LogConsole logger;
 
 int main()
 {
+    // Some flag variables
+    struct
+    {
+        // status flags
+        bool wireframe_on = true;
+        bool add_vertex = true;
+        bool render_loop_end = false;
+
+        // control flags
+        bool load_boundary_from_file = true;
+    } flags;
+
     // Initialize window (and OpenGL context)
     MyGL::Window window(1500, 1000, "Optimal Boundary for Poisson Mesh Merging");
 
@@ -259,7 +185,7 @@ int main()
     Mesh source_mesh, target_mesh;
     try
     {
-        OpenMesh::IO::read_mesh(source_mesh, "data/models/max-planck.obj");
+        OpenMesh::IO::read_mesh(source_mesh, "data/models/camelhead.obj");
         OpenMesh::IO::read_mesh(target_mesh, "data/models/ball.obj");
     }
     catch (const std::exception &e)
@@ -312,29 +238,18 @@ int main()
 
     auto io = ImGui::GetIO();
 
-    // Some status variables
-    struct
-    {
-        bool wireframe_on = true;
-        bool select_vertex_mode = false;
-        bool load_boundary_from_file = false;
-    } status;
-
     // Variables for selecting the boundaries
-    SelectCut cut_src(source_mesh),
-        cut_feat(source_mesh),
-        cut_tgt(target_mesh);
+    MeshClosedPath bdr_src(source_mesh), bdr_feat(source_mesh), bdr_tgt(target_mesh);
 
-    MyGL::PointCloud gl_pointcloud_s0(cut_src.seam_points),
-        gl_pointcloud_feat(cut_feat.seam_points),
-        gl_pointcloud_tgt(cut_tgt.seam_points);
+    MyGL::PointCloud gl_pointcloud_s0(bdr_src.points),
+        gl_pointcloud_feat(bdr_feat.points),
+        gl_pointcloud_tgt(bdr_tgt.points);
 
     // GUI variables
     enum class MeshType
     {
         SOURCE,
-        TARGET,
-        RESULT
+        TARGET
     } mesh_type = MeshType::SOURCE;
 
     enum class BoundaryType
@@ -350,15 +265,21 @@ int main()
 
     while (!window.should_close())
     {
-        if (status.load_boundary_from_file)
+        if (flags.load_boundary_from_file)
             break;
+
+        if (flags.render_loop_end)
+        {
+            flags.render_loop_end = false;
+            break;
+        }
 
         // per-frame time logic
         float current_frame_time = static_cast<float>(glfwGetTime());
         delta_time = current_frame_time - last_frame_time;
         last_frame_time = current_frame_time;
 
-        // input
+        // process input
         // ==================================================
         window.poll_events();
         window.process_input();
@@ -372,52 +293,6 @@ int main()
 
         basic.set_MVP(model, view, projection);
 
-        // render
-        // ==================================================
-        glEnable(GL_MULTISAMPLE);
-        glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-        // draw the mesh
-        basic.use();
-
-        if (mesh_type == MeshType::SOURCE) // draw the source mesh
-        {
-            // mesh
-            if (status.wireframe_on)
-            {
-                basic.set_uniform("color", glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
-                gl_mesh_src.draw_wireframe();
-            }
-            basic.set_uniform("color", glm::vec4(1.0f, 0.5f, 0.2f, 1.0f));
-            gl_mesh_src.draw();
-
-            // boundary of sigma_0
-            glPointSize(10.0f);
-            basic.set_uniform("color", glm::vec4(0.1f, 0.8f, 0.1f, 1.0f));
-            gl_pointcloud_s0.draw();
-
-            // boundary of sigma_feat
-            basic.set_uniform("color", glm::vec4(0.1f, 0.1f, 0.8f, 1.0f));
-            gl_pointcloud_feat.draw();
-        }
-        else if (mesh_type == MeshType::TARGET) // draw the target mesh
-        {
-            // mesh
-            if (status.wireframe_on)
-            {
-                basic.set_uniform("color", glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
-                gl_mesh_tgt.draw_wireframe();
-            }
-            basic.set_uniform("color", glm::vec4(1.0f, 0.5f, 0.2f, 1.0f));
-            gl_mesh_tgt.draw();
-
-            // boundary of sigma_tgt
-            glPointSize(10.0f);
-            basic.set_uniform("color", glm::vec4(0.8f, 0.1f, 0.1f, 1.0f));
-            gl_pointcloud_tgt.draw();
-        }
-
         // imgui
         // ==================================================
         ImGui_ImplOpenGL3_NewFrame();
@@ -426,7 +301,7 @@ int main()
 
         ImGui::Begin("Settings");
 
-        ImGui::Checkbox("Wireframe", &status.wireframe_on);
+        ImGui::Checkbox("Wireframe", &flags.wireframe_on);
 
         // Select which mesh to display
         const char *mesh_items[] = {"Source", "Target"};
@@ -448,38 +323,35 @@ int main()
             ImGui::EndCombo();
         }
 
-        auto gui_add_vertex = [&](SelectCut &boundary, MyGL::Mesh &gl_mesh, MyGL::PointCloud &gl_pointcloud, glm::mat4 mvp)
+        auto gui_add_vertex = [&](MeshClosedPath &boundary, MyGL::Mesh &gl_mesh, MyGL::PointCloud &gl_pointcloud, glm::mat4 mvp)
         {
-            if (boundary.is_seam_closed())
+            if (boundary.is_path_closed())
                 ImGui::Text("The cut is closed");
             else
             {
-                ImGui::Checkbox("Add vertex", &status.select_vertex_mode);
-                if (ImGui::Button("Close cut"))
-                    if (boundary.close_seam())
-                    {
-                        status.select_vertex_mode = false;
+                ImGui::Checkbox("Add vertex with mouse click", &flags.add_vertex);
+                if (ImGui::Button("Close the path"))
+                    if (boundary.close_path())
                         gl_pointcloud.update();
+
+                if (flags.add_vertex)
+                    if (!io.WantCaptureMouse && ImGui::IsMouseClicked(0)) // 0 is the left mouse button
+                    {
+                        ImVec2 mouse_pos = ImGui::GetMousePos();
+                        logger.log("Mouse clicked at ({}, {})", mouse_pos.x, mouse_pos.y);
+
+                        auto [width, height] = window.get_framebuffer_size();
+                        int index = pick_vertex.pick_vertex(mouse_pos.x, height - mouse_pos.y, gl_mesh, mvp);
+                        logger.log("Selected vertex {}", index);
+
+                        if (index >= 0) // -1 means no vertex is selected
+                        {
+                            boundary.add_vertex(source_mesh.vertex_handle(index));
+                            gl_pointcloud.update();
+                        }
                     }
             }
             ImGui::Text(boundary.vertices_to_string().c_str());
-
-            if (status.select_vertex_mode)
-                if (!io.WantCaptureMouse && ImGui::IsMouseClicked(0)) // 0 is the left mouse button
-                {
-                    ImVec2 mouse_pos = ImGui::GetMousePos();
-                    log.log("Mouse clicked at ({}, {})", mouse_pos.x, mouse_pos.y);
-
-                    auto [width, height] = window.get_framebuffer_size();
-                    int index = pick_vertex.pick_vertex(mouse_pos.x, height - mouse_pos.y, gl_mesh, mvp);
-                    log.log("Selected vertex {}", index);
-
-                    if (index >= 0) // -1 means no vertex is selected
-                    {
-                        boundary.add_vertex(source_mesh.vertex_handle(index));
-                        gl_pointcloud.update();
-                    }
-                }
         };
 
         if (mesh_type == MeshType::SOURCE)
@@ -509,23 +381,69 @@ int main()
             switch (boundary_type)
             {
             case BoundaryType::SOURCE:
-                gui_add_vertex(cut_src, gl_mesh_src, gl_pointcloud_s0, projection * view * model);
+                gui_add_vertex(bdr_src, gl_mesh_src, gl_pointcloud_s0, projection * view * model);
                 break;
             case BoundaryType::FEATURE:
-                gui_add_vertex(cut_feat, gl_mesh_src, gl_pointcloud_feat, projection * view * model);
+                gui_add_vertex(bdr_feat, gl_mesh_src, gl_pointcloud_feat, projection * view * model);
                 break;
             }
         }
         else if (mesh_type == MeshType::TARGET)
-            gui_add_vertex(cut_tgt, gl_mesh_tgt, gl_pointcloud_tgt, projection * view * model);
+            gui_add_vertex(bdr_tgt, gl_mesh_tgt, gl_pointcloud_tgt, projection * view * model);
 
-        if (cut_src.is_seam_closed() && cut_feat.is_seam_closed() && cut_tgt.is_seam_closed())
-            if (ImGui::Button("Generate Optimal Boundaries"))
-                break;
+        if (bdr_src.is_path_closed() && bdr_feat.is_path_closed() && bdr_tgt.is_path_closed())
+            if (ImGui::Button("Proceed"))
+                flags.render_loop_end = true;
 
         ImGui::End();
 
-        log.draw();
+        logger.draw();
+
+        // render
+        // ==================================================
+        glEnable(GL_MULTISAMPLE);
+        glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        // draw the mesh
+        basic.use();
+
+        if (mesh_type == MeshType::SOURCE) // draw the source mesh
+        {
+            // mesh
+            if (flags.wireframe_on)
+            {
+                basic.set_uniform("color", glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
+                gl_mesh_src.draw_wireframe();
+            }
+            basic.set_uniform("color", glm::vec4(1.0f, 0.5f, 0.2f, 1.0f));
+            gl_mesh_src.draw();
+
+            // boundary of sigma_0
+            glPointSize(10.0f);
+            basic.set_uniform("color", glm::vec4(0.1f, 0.8f, 0.1f, 1.0f));
+            gl_pointcloud_s0.draw();
+
+            // boundary of sigma_feat
+            basic.set_uniform("color", glm::vec4(0.1f, 0.1f, 0.8f, 1.0f));
+            gl_pointcloud_feat.draw();
+        }
+        else if (mesh_type == MeshType::TARGET) // draw the target mesh
+        {
+            // mesh
+            if (flags.wireframe_on)
+            {
+                basic.set_uniform("color", glm::vec4(0.5f, 0.95f, 0.5f, 0.95f));
+                gl_mesh_tgt.draw_wireframe();
+            }
+            basic.set_uniform("color", glm::vec4(0.5f, 0.2f, 1.0f, 0.2f));
+            gl_mesh_tgt.draw();
+
+            // boundary of sigma_tgt
+            glPointSize(10.0f);
+            basic.set_uniform("color", glm::vec4(0.8f, 0.1f, 0.1f, 1.0f));
+            gl_pointcloud_tgt.draw();
+        }
 
         ImGui::Render();
 
@@ -534,46 +452,42 @@ int main()
         window.swap_buffers();
     }
 
-    // if (!status.load_boundary_from_file)
-    // {
-    //     // print the selected vertices to a file
-    //     std::ofstream seam_file("data/seam_vertices.txt");
-    //     for (const auto &v : cut_src.seam_vertices)
-    //         seam_file << v.idx() << " ";
-    //     seam_file << std::endl;
-    //     for (const auto &v : cut_feat.seam_vertices)
-    //         seam_file << v.idx() << " ";
-    //     seam_file << std::endl;
-    //     for (const auto &v : cut_tgt.seam_vertices)
-    //         seam_file << v.idx() << " ";
-    //     seam_file << std::endl;
-    // }
-
-    if (status.load_boundary_from_file)
-    {
-        // load the selected vertices from a file
-        std::ifstream seam_file_in("data/seam_vertices.txt");
-        auto read_a_line = [&](std::vector<Mesh::VertexHandle> &vertices)
+    if (flags.load_boundary_from_file)
+    { // load the selected vertices from a file
+        std::ifstream input_file("data/seam_vertices.txt");
+        auto read_a_line = [&input_file](std::vector<Mesh::VertexHandle> &vertices)
         {
             std::string line;
-            std::getline(seam_file_in, line);
+            std::getline(input_file, line);
             std::istringstream iss(line);
             int v_idx;
             while (iss >> v_idx)
-                vertices.push_back(source_mesh.vertex_handle(v_idx));
+                vertices.push_back(Mesh::VertexHandle(v_idx));
         };
-        read_a_line(cut_src.seam_vertices);
-        read_a_line(cut_feat.seam_vertices);
-        read_a_line(cut_tgt.seam_vertices);
+        read_a_line(bdr_src.vertices);
+        read_a_line(bdr_feat.vertices);
+        read_a_line(bdr_tgt.vertices);
+    }
+    else
+    { // print the selected vertices to a file
+        std::ofstream file("data/seam_vertices.txt");
+        for (const auto &v : bdr_src.vertices)
+            file << v.idx() << " ";
+        file << std::endl;
+        for (const auto &v : bdr_feat.vertices)
+            file << v.idx() << " ";
+        file << std::endl;
+        for (const auto &v : bdr_tgt.vertices)
+            file << v.idx() << " ";
+        file << std::endl;
     }
 
     OptimalBoundaries ob(source_mesh, target_mesh,
-                         cut_src.seam_vertices, cut_feat.seam_vertices, cut_tgt.seam_vertices);
-    ob.preprocessing();
+                         bdr_src.vertices, bdr_feat.vertices, bdr_tgt.vertices);
+    ob.preprocessing(); // generate band, stripe and disk, and parameterize them
 
-    // OpenMesh::IO::write_mesh(ob.get_band(), "data/models/band.obj");
-    // OpenMesh::IO::write_mesh(ob.get_band_filled(), "data/models/band_filled.obj");
-    // OpenMesh::IO::write_mesh(ob.get_stripe(), "data/models/stripe.obj");
+    OpenMesh::IO::write_mesh(ob.get_band(), "data/band.obj");
+    OpenMesh::IO::write_mesh(ob.get_stripe(), "data/stripe.obj");
 
     auto gen_uv_glmesh = [](const Mesh &mesh, Eigen::MatrixX2d &uv)
     {
@@ -600,14 +514,19 @@ int main()
         float offset_y = 0.0;
     } para_binding;
 
-    bool should_close = false;
+    std::vector<OpenMesh::VertexHandle> optimal_boundary;
+    std::vector<glm::vec3> optimal_boundary_points;
+    MyGL::PointCloud gl_optimal_boundary(optimal_boundary_points);
 
     // Main loop 2 (bind parameterization)
     // ==================================================
     while (!window.should_close())
     {
-        if (should_close)
+        if (flags.render_loop_end)
+        {
+            flags.render_loop_end = false;
             break;
+        }
 
         // input
         // ==================================================
@@ -626,37 +545,6 @@ int main()
             projection = glm::ortho(-1.0f, 1.0f, -1.0f / aspect_ratio, 1.0f / aspect_ratio, -1.0f, 1.0f);
 
         basic.set_MVP(model, view, projection);
-
-        // render
-        // ==================================================
-        glEnable(GL_MULTISAMPLE);
-        glClearColor(1.0f, 1.0f, 1.0f, 0.2f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-        basic.use();
-
-        // draw the disk (from the target mesh)
-        if (status.wireframe_on)
-        {
-            basic.set_uniform("color", glm::vec4(0.5f, 0.95f, 0.5f, 0.95f));
-            gl_disk.draw_wireframe();
-        }
-        basic.set_uniform("color", glm::vec4(0.5f, 0.2f, 1.0f, 0.2f));
-        gl_disk.draw();
-
-        // draw the band (from the source mesh)
-        model = glm::scale(model, glm::vec3(para_binding.scale));
-        model = glm::rotate(model, para_binding.rotation_angle, glm::vec3(0.0f, 0.0f, 1.0f));
-        model = glm::translate(model, glm::vec3(para_binding.offset_x, para_binding.offset_y, 0.1f));
-        basic.set_uniform("model", model);
-
-        if (status.wireframe_on)
-        {
-            basic.set_uniform("color", glm::vec4(0.95f, 0.95f, 0.95f, 0.95f));
-            gl_band.draw_wireframe();
-        }
-        basic.set_uniform("color", glm::vec4(1.0f, 0.5f, 0.2f, 0.5f));
-        gl_band.draw();
 
         // imgui
         // ==================================================
@@ -666,7 +554,7 @@ int main()
 
         ImGui::Begin("Settings");
 
-        ImGui::Checkbox("Wireframe", &status.wireframe_on);
+        ImGui::Checkbox("Wireframe", &flags.wireframe_on);
 
         ImGui::SliderFloat("Scale", &para_binding.scale, 0.1f, 2.0f);
         ImGui::SliderAngle("Rotation", &para_binding.rotation_angle);
@@ -674,61 +562,36 @@ int main()
         ImGui::SliderFloat("Offset Y", &para_binding.offset_y, -1.0f, 1.0f);
 
         if (ImGui::Button("Confirm Binding"))
-            should_close = true;
+        {
+            ob.set_para_bindings(para_binding.scale, para_binding.rotation_angle / 180.0 * M_PI,
+                                 {para_binding.offset_x, para_binding.offset_y});
+            ob.run();
+
+            logger.log("Parameters: scale={}, rotation={}, offset=({}, {})",
+                       para_binding.scale, para_binding.rotation_angle, para_binding.offset_x, para_binding.offset_y);
+
+            logger.log("Optimal energy: {}", ob.get_optimal_energy());
+
+            optimal_boundary = ob.get_optimal_boundary();
+            optimal_boundary_points.resize(optimal_boundary.size());
+            for (int i = 0; i < optimal_boundary.size(); i++)
+                optimal_boundary_points[i] = glm::vec3(band_uv(optimal_boundary[i].idx(), 0),
+                                                       band_uv(optimal_boundary[i].idx(), 1),
+                                                       0.0f);
+            gl_optimal_boundary.update();
+
+            std::string optimal_boundary_str;
+            for (const auto &v : optimal_boundary)
+                optimal_boundary_str += std::to_string(v.idx()) + " ";
+            logger.log("Optimal boundary vertices: {}", optimal_boundary_str);
+        }
+
+        if (ImGui::Button("Proceed"))
+            flags.render_loop_end = true;
 
         ImGui::End();
 
-        log.draw();
-
-        ImGui::Render();
-
-        // render imgui and swap buffers
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        window.swap_buffers();
-    }
-
-    // Set the bindings
-    ob.set_para_bindings(para_binding.scale, para_binding.rotation_angle / 180.0 * M_PI,
-                         {para_binding.offset_x, para_binding.offset_y});
-
-    mesh_type = MeshType::SOURCE;
-
-    ob.run();
-
-    auto optimal_boundary = ob.get_optimal_boundary();
-    std::vector<glm::vec3> optimal_boundary_points(optimal_boundary.size());
-    for (int i = 0; i < optimal_boundary.size(); i++)
-        optimal_boundary_points[i] = glm::vec3(band_uv(optimal_boundary[i].idx(), 0),
-                                               band_uv(optimal_boundary[i].idx(), 1),
-                                               0.1f);
-    MyGL::PointCloud gl_optimal_boundary(optimal_boundary_points);
-
-    should_close = false;
-
-    // Main loop 3
-    // ==================================================
-    while (!window.should_close())
-    {
-        if (should_close)
-            break;
-
-        // input
-        // ==================================================
-        window.poll_events();
-        window.process_input();
-
-        // update mvp matrices
-        glm::mat4 model = glm::mat4(1.0f);
-        glm::mat4 view = glm::mat4(1.0f);
-        auto [width, height] = window.get_framebuffer_size();
-        glm::mat4 projection;
-        float aspect_ratio = static_cast<float>(width) / static_cast<float>(height);
-        if (aspect_ratio > 1.0f)
-            projection = glm::ortho(-aspect_ratio, aspect_ratio, -1.0f, 1.0f, -1.0f, 1.0f);
-        else
-            projection = glm::ortho(-1.0f, 1.0f, -1.0f / aspect_ratio, 1.0f / aspect_ratio, -1.0f, 1.0f);
-
-        basic.set_MVP(model, view, projection);
+        logger.draw();
 
         // render
         // ==================================================
@@ -739,7 +602,7 @@ int main()
         basic.use();
 
         // draw the disk (from the target mesh)
-        if (status.wireframe_on)
+        if (flags.wireframe_on)
         {
             basic.set_uniform("color", glm::vec4(0.5f, 0.95f, 0.5f, 0.95f));
             gl_disk.draw_wireframe();
@@ -748,12 +611,12 @@ int main()
         gl_disk.draw();
 
         // draw the band (from the source mesh)
-        model = glm::scale(model, glm::vec3(para_binding.scale));
-        model = glm::rotate(model, para_binding.rotation_angle, glm::vec3(0.0f, 0.0f, 1.0f));
         model = glm::translate(model, glm::vec3(para_binding.offset_x, para_binding.offset_y, 0.1f));
+        model = glm::rotate(model, para_binding.rotation_angle, glm::vec3(0.0f, 0.0f, 1.0f));
+        model = glm::scale(model, glm::vec3(para_binding.scale));
         basic.set_uniform("model", model);
 
-        if (status.wireframe_on)
+        if (flags.wireframe_on)
         {
             basic.set_uniform("color", glm::vec4(0.95f, 0.95f, 0.95f, 0.95f));
             gl_band.draw_wireframe();
@@ -765,6 +628,48 @@ int main()
         basic.set_uniform("color", glm::vec4(0.1f, 0.8f, 0.1f, 1.0f));
         gl_optimal_boundary.draw();
 
+        // render imgui
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        // swap buffers
+        window.swap_buffers();
+    }
+
+    ob.merge();
+    Mesh feat_merged = ob.get_merged_mesh();
+    MeshConverter feat_merged_conv(feat_merged);
+    MyGL::Mesh gl_feat_merged(feat_merged_conv.vertices, feat_merged_conv.indices);
+
+    // Main loop 3 (show merged mesh)
+    // ==================================================
+    while (!window.should_close())
+    {
+        if (flags.render_loop_end)
+        {
+            flags.render_loop_end = false;
+            break;
+        }
+
+        // per-frame time logic
+        float current_frame_time = static_cast<float>(glfwGetTime());
+        delta_time = current_frame_time - last_frame_time;
+        last_frame_time = current_frame_time;
+
+        // process input
+        // ==================================================
+        window.poll_events();
+        window.process_input();
+        window.process_input_camera(camera, delta_time);
+
+        // update mvp matrices
+        glm::mat4 model = glm::mat4(1.0f);
+        glm::mat4 view = camera.get_view_matrix() * camera.get_model_matrix();
+        auto [width, height] = window.get_framebuffer_size();
+        glm::mat4 projection = camera.get_projection_matrix(static_cast<float>(width) / height);
+
+        basic.set_MVP(model, view, projection);
+
         // imgui
         // ==================================================
         ImGui_ImplOpenGL3_NewFrame();
@@ -773,16 +678,41 @@ int main()
 
         ImGui::Begin("Settings");
 
-        ImGui::Checkbox("Wireframe", &status.wireframe_on);
+        ImGui::Checkbox("Wireframe", &flags.wireframe_on);
 
         ImGui::End();
 
-        // log.show_log_window();
+        logger.draw();
+
+        // render
+        // ==================================================
+        glEnable(GL_MULTISAMPLE);
+        glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        // draw the mesh
+        basic.use();
+
+        if (flags.wireframe_on)
+        {
+            basic.set_uniform("color", glm::vec4(0.5f, 0.95f, 0.5f, 0.95f));
+            gl_mesh_tgt.draw_wireframe();
+        }
+        basic.set_uniform("color", glm::vec4(0.5f, 0.2f, 1.0f, 0.2f));
+        gl_mesh_tgt.draw();
+
+        if (flags.wireframe_on)
+        {
+            basic.set_uniform("color", glm::vec4(1.0f, 1.0f, 1.0f, 1.0f));
+            gl_feat_merged.draw_wireframe();
+        }
+        basic.set_uniform("color", glm::vec4(1.0f, 0.5f, 0.2f, 1.0f));
+        gl_feat_merged.draw();
 
         ImGui::Render();
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         // render imgui and swap buffers
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         window.swap_buffers();
     }
 

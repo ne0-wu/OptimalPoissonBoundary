@@ -21,6 +21,8 @@ add_library(MyGL
 	PointCloud.cpp
 	PickVertex.h
 	PickVertex.cpp
+	LogConsole.h
+	LogConsole.cpp
 )
 
 target_include_directories(MyGL PRIVATE

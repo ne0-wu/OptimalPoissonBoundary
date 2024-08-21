@@ -19,6 +19,8 @@ public:
 
     void run();
 
+    void merge();
+
     void set_para_bindings(double scale, double rotation, const Eigen::Vector2d &offset);
 
     Mesh &get_band() { return band; }
@@ -30,12 +32,17 @@ public:
     Eigen::MatrixXd &get_disk_uv() { return disk_uv; }
 
     auto &get_optimal_boundary() { return optimal_boundary; }
+    double get_optimal_energy() { return optimal_energy; }
+
+    Mesh &get_merged_mesh() { return disk_feat; }
 
 private:
     const Mesh &source_mesh;
     const Mesh &target_mesh;
 
     std::vector<Mesh::VertexHandle> optimal_boundary;
+    double optimal_energy;
+    double convergence_threshold = 1e-6;
 
     // We assume that the boundary vertices are ordered in the right-hand rule (ccw) manner
     // (i.e. when you walk along the boundary, the mesh is on your left)
@@ -71,6 +78,11 @@ private:
     OpenMesh::VProp<Mesh::VertexHandle> tgt_to_disk; // Mapping from band vertices to disk vertices
     Eigen::MatrixXd disk_uv;
 
+    Mesh disk_feat;
+    OpenMesh::VProp<Mesh::VertexHandle> disk_feat_to_src;
+    OpenMesh::VProp<Mesh::VertexHandle> src_to_disk_feat;
+    Eigen::MatrixXd merged_pos;
+
     // parameterization bindings
     double scale;
     double rotation; // rad
@@ -91,6 +103,9 @@ private:
     // Cut out Omega_1 from the target mesh
     void gen_disk_mesh();
 
+    //
+    void gen_disk_mesh_feat();
+
     // Parameterize the filled band
     void parameterize_source();
 
@@ -101,7 +116,9 @@ private:
     // ==================================================
 
     // Find the face in the target mesh that contains the point, in the UV domain
-    PointQuery disk_rasterization(const Eigen::Vector2d &point);
+    PointQuery disk_rasterization(Eigen::Vector2d point);
+
+    Eigen::Matrix3d R;
 
     // Update the query of each vertex in the band mesh
     void update_band_to_disk();
@@ -109,4 +126,8 @@ private:
     // Main algorithm
     // ==================================================
     void find_optimal_boundary();
+
+    // Poisson mesh merging
+    // ==================================================
+    void poisson_mesh_merging();
 };

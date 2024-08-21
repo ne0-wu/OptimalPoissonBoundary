@@ -1,9 +1,13 @@
 #include <queue>
 
+#include <OpenMesh/Core/Utils/Predicates.hh>
+
 #include "Dijkstra.h"
 #include "Parameterization.h"
 
 #include "OptimalBoundaries.h"
+
+#include "MyGL/LogConsole.h"
 
 inline constexpr double infd = std::numeric_limits<double>::infinity();
 
@@ -19,7 +23,8 @@ OptimalBoundaries::OptimalBoundaries(const Mesh &source_mesh, const Mesh &target
       band_to_orig(band), orig_to_band(source_mesh),
       stripe_to_band(stripe), band_to_stripe(band),
       disk_to_tgt(disk), tgt_to_disk(target_mesh),
-      band_to_disk(band) {}
+      band_to_disk(band),
+      disk_feat_to_src(disk_feat), src_to_disk_feat(source_mesh) {}
 
 void OptimalBoundaries::preprocessing()
 {
@@ -34,9 +39,13 @@ void OptimalBoundaries::preprocessing()
 
 void OptimalBoundaries::run()
 {
-    update_band_to_disk();
-
     find_optimal_boundary();
+}
+
+void OptimalBoundaries::merge()
+{
+    gen_disk_mesh_feat();
+    poisson_mesh_merging();
 }
 
 void OptimalBoundaries::set_para_bindings(double scale, double rotation, const Eigen::Vector2d &offset)
@@ -44,6 +53,8 @@ void OptimalBoundaries::set_para_bindings(double scale, double rotation, const E
     this->scale = scale;
     this->rotation = rotation;
     this->offset = offset;
+
+    update_band_to_disk(); // TODO: bug within this func
 }
 
 void add_vertex(Mesh::VertexHandle v, const Mesh &old_mesh, Mesh &new_mesh,
@@ -327,18 +338,19 @@ void OptimalBoundaries::gen_filled_mesh()
 
     auto triangle_area = [&](int a, int b, int c)
     {
-        auto pa = band.point(boundary_vertices[a]);
-        auto pb = band.point(boundary_vertices[b]);
-        auto pc = band.point(boundary_vertices[c]);
+        Eigen::Vector3d pa = band.point(boundary_vertices[a]);
+        Eigen::Vector3d pb = band.point(boundary_vertices[b]);
+        Eigen::Vector3d pc = band.point(boundary_vertices[c]);
 
         return 0.5 * Eigen::cross((pb - pa), (pc - pa)).norm();
     };
 
-    // j = 2
+    // j == 2
     for (int i = 0; i < n; i++)
     {
         int m = (i + 1) % n;
         int k = (i + 2) % n;
+        W(i, m) = 0.0f;
         W(i, k) = triangle_area(i, m, k);
         O(i, k) = m;
     }
@@ -460,6 +472,76 @@ void OptimalBoundaries::gen_disk_mesh()
     }
 }
 
+void OptimalBoundaries::gen_disk_mesh_feat()
+{
+    // Iterate through vertices in the disk with a modified breadth-first search
+    std::queue<Mesh::VertexHandle> queue;
+    OpenMesh::VProp<bool> is_visited(false, source_mesh);
+    OpenMesh::VProp<bool> is_inserted_vert(false, source_mesh);
+    OpenMesh::FProp<bool> is_inserted_face(false, source_mesh);
+
+    auto add_v = [&](Mesh::VertexHandle v)
+    {
+        add_vertex(v, source_mesh, disk_feat, is_inserted_vert, src_to_disk_feat, disk_feat_to_src);
+    };
+    auto add_f = [&](Mesh::FaceHandle f)
+    {
+        add_face(f, source_mesh, disk_feat, is_inserted_face, src_to_disk_feat);
+    };
+
+    std::vector<Mesh::VertexHandle> boundary = optimal_boundary;
+    for (auto &v : boundary)
+        v = band_to_orig[v];
+
+    // Boundary vertices and faces
+    for (const auto &v : boundary)
+    {
+        is_visited[v] = true;
+        add_v(v);
+    }
+    // for (int i = 0; i < boundary.size() - 1; i++)
+    for (int i = boundary.size() - 1; i > 0; i--)
+    {
+        int j = i - 1;
+
+        Mesh::VertexHandle fr = boundary[i];
+        Mesh::VertexHandle to = boundary[j];
+        auto he = source_mesh.find_halfedge(fr, to);
+        auto op = he.next().to();
+
+        add_v(op);
+        add_f(he.face());
+
+        if (!is_visited[op])
+        {
+            queue.push(op);
+            is_visited[op] = true;
+        }
+    }
+
+    // Iterate through the rest of the disk
+    while (!queue.empty())
+    {
+        Mesh::VertexHandle v = queue.front();
+        queue.pop();
+
+        // Add adjacent vertices to the disk, and push unvisited vertices to the queue
+        for (const auto &v_a : source_mesh.vv_range(v))
+        {
+            add_v(v_a);
+            if (!is_visited[v_a])
+            {
+                queue.push(v_a);
+                is_visited[v_a] = true;
+            }
+        }
+
+        // Add adjacent faces to the disk
+        for (const auto &f : source_mesh.vf_range(v))
+            add_f(f);
+    }
+}
+
 void OptimalBoundaries::parameterize_source()
 {
     LocalGlobal local_global(band_filled);
@@ -476,7 +558,7 @@ void OptimalBoundaries::parameterize_target()
     disk_uv = 2.0 * disk_uv.array() - 1.0;
 }
 
-OptimalBoundaries::PointQuery OptimalBoundaries::disk_rasterization(const Eigen::Vector2d &point)
+OptimalBoundaries::PointQuery OptimalBoundaries::disk_rasterization(Eigen::Vector2d point)
 {
     // Note that this is a rasterization process, so we can switch to OpenGL to do it more efficiently
 
@@ -511,9 +593,11 @@ void OptimalBoundaries::update_band_to_disk()
 {
     for (const auto &v : band.vertices())
     {
-        auto uv = band_uv.row(v.idx());
+        Eigen::Vector2d uv = band_uv.row(v.idx());
         uv = offset + Eigen::Rotation2Dd(rotation).matrix() * scale * Eigen::Vector2d(uv[0], uv[1]);
         band_to_disk[v] = disk_rasterization(uv);
+        if (!band_to_disk[v].face.is_valid())
+            logger.log("Warning: vertex {} is not in the disk", v.idx());
     }
 }
 
@@ -528,7 +612,9 @@ void OptimalBoundaries::find_optimal_boundary()
     for (const auto &e : band.edges())
         band_edge_length[e] = band.calc_edge_length(e);
 
-    for (int num_iter = 1; num_iter <= 100; num_iter++)
+    double last_energy = infd;
+
+    for (int num_iter = 1; num_iter <= 300; num_iter++)
     {
         int n = optimal_boundary.size();
 
@@ -561,7 +647,7 @@ void OptimalBoundaries::find_optimal_boundary()
         // Calculate the covariance matrix and the rotation matrix
         Eigen::Matrix3d H = band_points.transpose() * disk_points;
         Eigen::JacobiSVD<Eigen::Matrix3d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
-        Eigen::Matrix3d R = svd.matrixV() * svd.matrixU().transpose();
+        R = svd.matrixV() * svd.matrixU().transpose();
 
         // Calculate the translation
         Eigen::Vector3d t = disk_centroid - R * band_centroid;
@@ -580,9 +666,6 @@ void OptimalBoundaries::find_optimal_boundary()
             Eigen::Vector3d disk_edge = band_to_disk[to].point - band_to_disk[fr].point;
 
             band_weight[e] = (R * band_edge - disk_edge).norm() * band_edge_length[e];
-
-            // std::cout << band_edge.transpose() << ' '
-            //           << disk_edge.transpose() << ' ' << band_weight[e] << '\n';
         }
 
         // Move the weights to the stripe
@@ -615,6 +698,8 @@ void OptimalBoundaries::find_optimal_boundary()
             }
         }
 
+        logger.log("Iteration {}: {} {}", num_iter, min_cost, min_index);
+
         // Extract the optimal boundary
         std::vector<Mesh::VertexHandle> new_optimal_boundary;
         auto v_start = seam_vertices_stripe_1[min_index];
@@ -628,5 +713,82 @@ void OptimalBoundaries::find_optimal_boundary()
         new_optimal_boundary.push_back(stripe_to_band[v_start]);
 
         optimal_boundary = new_optimal_boundary;
+        optimal_energy = min_cost;
+
+        if (std::abs(last_energy - optimal_energy) < convergence_threshold)
+            break;
+
+        last_energy = optimal_energy;
     }
+}
+
+double opposite_angle(Mesh mesh, Mesh::HalfedgeHandle heh)
+{
+    auto p0 = mesh.point(mesh.from_vertex_handle(heh));
+    auto p1 = mesh.point(mesh.to_vertex_handle(heh));
+    auto p2 = mesh.point(mesh.to_vertex_handle(mesh.next_halfedge_handle(heh)));
+
+    return acos(((p1 - p2).normalized()).dot((p0 - p2).normalized()));
+}
+
+void OptimalBoundaries::poisson_mesh_merging()
+{
+    // Compute cotangent laplacian for disk_feat
+    std::vector<Eigen::Triplet<double>> triplets;
+    triplets.reserve(disk_feat.n_halfedges() * 4);
+    for (const auto &h : disk_feat.halfedges())
+    {
+        if (h.is_boundary())
+            continue;
+        double cot = 1.0 / tan(opposite_angle(disk_feat, h));
+
+        auto fr = h.from(), to = h.to();
+        if (!fr.is_boundary())
+        {
+            triplets.push_back({fr.idx(), fr.idx(), cot});
+            triplets.push_back({fr.idx(), to.idx(), -cot});
+        }
+        if (!to.is_boundary())
+        {
+            triplets.push_back({to.idx(), to.idx(), cot});
+            triplets.push_back({to.idx(), fr.idx(), -cot});
+        }
+    }
+    for (const auto &v : disk_feat.vertices())
+        if (v.is_boundary())
+            triplets.push_back({v.idx(), v.idx(), 100.0});
+    Eigen::SparseMatrix<double> L(disk_feat.n_vertices(), disk_feat.n_vertices());
+    L.setFromTriplets(triplets.begin(), triplets.end());
+
+    // Compute b
+    Eigen::MatrixXd b(disk_feat.n_vertices(), 3);
+
+    for (const auto &v : disk_feat.vertices())
+        b.row(v.idx()) = R * disk_feat.point(v);
+    // b.row(v.idx()) = Eigen::Vector3d::Zero();
+    b = L * b;
+
+    std::cout << std::endl;
+
+    for (const auto &v : disk_feat.vertices())
+        if (v.is_boundary())
+        {
+            b.row(v.idx()) = band_to_disk[orig_to_band[disk_feat_to_src[v]]].point * 100.0;
+            std::cout << b.row(v.idx()).norm() << ' ';
+        }
+
+    // Solve the linear system
+    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+    solver.compute(L);
+    merged_pos = solver.solve(b);
+
+    for (const auto &v : disk_feat.vertices())
+        if (v.is_boundary())
+        {
+            std::cout << merged_pos.row(v.idx()).norm() << ' ';
+        }
+
+    // Update the positions
+    for (const auto &v : disk_feat.vertices())
+        disk_feat.set_point(v, merged_pos.row(v.idx()));
 }
