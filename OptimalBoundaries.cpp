@@ -24,7 +24,7 @@ OptimalBoundaries::OptimalBoundaries(const Mesh &source_mesh, const Mesh &target
       stripe_to_band(stripe), band_to_stripe(band),
       disk_to_tgt(disk), tgt_to_disk(target_mesh),
       band_to_disk(band),
-      disk_feat_to_src(disk_feat), src_to_disk_feat(source_mesh) {}
+      merged_to_orig(merged_mesh), orig_to_merged(source_mesh) {}
 
 void OptimalBoundaries::preprocessing()
 {
@@ -46,6 +46,7 @@ void OptimalBoundaries::merge()
 {
     gen_disk_mesh_feat();
     poisson_mesh_merging();
+    gen_merged_mesh();
 }
 
 void OptimalBoundaries::set_para_bindings(double scale, double rotation, const Eigen::Vector2d &offset)
@@ -54,7 +55,7 @@ void OptimalBoundaries::set_para_bindings(double scale, double rotation, const E
     this->rotation = rotation;
     this->offset = offset;
 
-    update_band_to_disk(); // TODO: bug within this func
+    update_band_to_disk();
 }
 
 void add_vertex(Mesh::VertexHandle v, const Mesh &old_mesh, Mesh &new_mesh,
@@ -185,19 +186,19 @@ void OptimalBoundaries::gen_stripe_mesh()
     seam_vertices.push_back(cut_begin);
 
     // Shorten the seam by removing the part of the seam on the boundary
-    OpenMesh::VProp<bool> is_band_boundary(false, band);
-    for (const auto &v : source_boundary_vertices)
-        is_band_boundary[orig_to_band[v]] = true;
-    for (const auto &v : feature_boundary_vertices)
-        is_band_boundary[orig_to_band[v]] = true;
+    // OpenMesh::VProp<bool> is_band_boundary(false, band);
+    // for (const auto &v : source_boundary_vertices)
+    //     is_band_boundary[orig_to_band[v]] = true;
+    // for (const auto &v : feature_boundary_vertices)
+    //     is_band_boundary[orig_to_band[v]] = true;
 
-    auto new_begin = seam_vertices.begin(), new_end = seam_vertices.end();
-    while (is_band_boundary[*(new_begin + 1)])
-        new_begin++;
-    while (is_band_boundary[*(new_end - 2)])
-        new_end--;
+    // auto new_begin = seam_vertices.begin(), new_end = seam_vertices.end();
+    // while (is_band_boundary[*(new_begin + 1)])
+    //     new_begin++;
+    // while (is_band_boundary[*(new_end - 2)])
+    //     new_end--;
 
-    seam_vertices = std::vector<Mesh::VertexHandle>(new_begin, new_end);
+    // seam_vertices = std::vector<Mesh::VertexHandle>(new_begin, new_end);
 
     seam_vertices_stripe_1.reserve(seam_vertices.size());
     seam_vertices_stripe_2.reserve(seam_vertices.size());
@@ -220,15 +221,31 @@ void OptimalBoundaries::gen_stripe_mesh()
 
     // Add the boundary faces to the band,
     // and push the opposite vertices to the queue.
+    // do it twice, because the seam vertices should be duplicated in the stripe.
     auto deal_with_seam = [&]()
     {
-        // do it twice, because the seam vertices should be duplicated in the stripe
         for (const auto &v : seam_vertices)
         {
             auto new_v = stripe.add_vertex(band.point(v));
             stripe_to_band[new_v] = v;
             band_to_stripe[v] = new_v;
         }
+
+        auto add_face_from_he = [&](OpenMesh::SmartHalfedgeHandle he)
+        {
+            auto f = he.face();
+            for (const auto &v : f.vertices())
+            {
+                add_v(v);
+                if (!is_visited[v])
+                {
+                    queue.push(v);
+                    is_visited[v] = true;
+                }
+            }
+
+            add_f(f);
+        };
 
         for (int i = 0; i < seam_vertices.size() - 2; i++)
         {
@@ -238,22 +255,7 @@ void OptimalBoundaries::gen_stripe_mesh()
 
             is_visited[fr] = true;
             is_visited[to] = true;
-
-            auto add_face_from_he = [&](OpenMesh::SmartHalfedgeHandle he)
-            {
-                auto f = he.face();
-                for (const auto &v : f.vertices())
-                {
-                    add_v(v);
-                    if (!is_visited[v])
-                    {
-                        queue.push(v);
-                        is_visited[v] = true;
-                    }
-                }
-
-                add_f(f);
-            };
+            is_visited[nx] = true;
 
             // add the faces in the clockwise order
             auto he_start = band.find_halfedge(fr, to);
@@ -266,6 +268,15 @@ void OptimalBoundaries::gen_stripe_mesh()
             if (i == 0)
                 for (auto he = he_start; !he.is_boundary(); he = he.prev().opp())
                     add_face_from_he(he);
+        }
+
+        {
+            // do it for the last two vertices
+            Mesh::VertexHandle fr = seam_vertices[seam_vertices.size() - 2];
+            Mesh::VertexHandle to = seam_vertices[seam_vertices.size() - 1];
+            auto he_start = band.find_halfedge(fr, to);
+            for (auto he = he_start; !he.is_boundary(); he = he.next().opp())
+                add_face_from_he(he);
         }
     };
     deal_with_seam();
@@ -319,16 +330,10 @@ private:
     int rows, cols;
 };
 
-void OptimalBoundaries::gen_filled_mesh()
+// void mesh_completion(Mesh &mesh, const std::vector<Mesh::VertexHandle> boundary_vertices)
+void mesh_completion(Mesh &mesh, const std::vector<Mesh::VertexHandle> boundary_vertices)
 {
-    band_filled = band;
-
-    // Find the boundary vertices of the hole to fill in
-    // When you walk along the boundary, the band mesh is on your left and the hole is on your right
-    std::vector<Mesh::VertexHandle> boundary_vertices = feature_boundary_vertices;
-    std::reverse(boundary_vertices.begin(), boundary_vertices.end());
-    for (auto &v : boundary_vertices)
-        v = orig_to_band[v];
+    // When you walk along the boundary, the original mesh is on your left and the hole is on your right
 
     // Fill in the hole using the method from 'Filling gaps in the boundary of a polyhedron'
     // Minimizing the total face area
@@ -338,9 +343,9 @@ void OptimalBoundaries::gen_filled_mesh()
 
     auto triangle_area = [&](int a, int b, int c)
     {
-        Eigen::Vector3d pa = band.point(boundary_vertices[a]);
-        Eigen::Vector3d pb = band.point(boundary_vertices[b]);
-        Eigen::Vector3d pc = band.point(boundary_vertices[c]);
+        Eigen::Vector3d pa = mesh.point(boundary_vertices[a]);
+        Eigen::Vector3d pb = mesh.point(boundary_vertices[b]);
+        Eigen::Vector3d pc = mesh.point(boundary_vertices[c]);
 
         return 0.5 * Eigen::cross((pb - pa), (pc - pa)).norm();
     };
@@ -391,7 +396,9 @@ void OptimalBoundaries::gen_filled_mesh()
                 (min_area_start + n - 1) % n});
     auto add_f = [&](int i, int m, int k)
     {
-        band_filled.add_face(boundary_vertices[i], boundary_vertices[m], boundary_vertices[k]);
+        auto f = mesh.add_face(boundary_vertices[i], boundary_vertices[m], boundary_vertices[k]);
+        if (!f.is_valid())
+            mesh.add_face(boundary_vertices[k], boundary_vertices[m], boundary_vertices[i]);
     };
     while (!queue.empty())
     {
@@ -407,36 +414,50 @@ void OptimalBoundaries::gen_filled_mesh()
     }
 }
 
-void OptimalBoundaries::gen_disk_mesh()
+void OptimalBoundaries::gen_filled_mesh()
+{
+    band_filled = band;
+
+    // Find the boundary vertices of the hole to fill in
+    std::vector<Mesh::VertexHandle> boundary_vertices = feature_boundary_vertices;
+    std::reverse(boundary_vertices.begin(), boundary_vertices.end());
+    for (auto &v : boundary_vertices)
+        v = orig_to_band[v];
+
+    mesh_completion(band_filled, boundary_vertices);
+}
+
+void cut_mesh(const Mesh &orig_mesh, Mesh &cutted_mesh, const std::vector<Mesh::VertexHandle> &seam_vertices,
+              OpenMesh::VProp<Mesh::VertexHandle> &orig_to_cutted, OpenMesh::VProp<Mesh::VertexHandle> &cutted_to_orig)
 {
     // Iterate through vertices in the disk with a modified breadth-first search
     std::queue<Mesh::VertexHandle> queue;
-    OpenMesh::VProp<bool> is_visited(false, target_mesh);
-    OpenMesh::VProp<bool> is_inserted_vert(false, target_mesh);
-    OpenMesh::FProp<bool> is_inserted_face(false, target_mesh);
+    OpenMesh::VProp<bool> is_visited(false, orig_mesh);
+    OpenMesh::VProp<bool> is_inserted_vert(false, orig_mesh);
+    OpenMesh::FProp<bool> is_inserted_face(false, orig_mesh);
 
     auto add_v = [&](Mesh::VertexHandle v)
     {
-        add_vertex(v, target_mesh, disk, is_inserted_vert, tgt_to_disk, disk_to_tgt);
+        add_vertex(v, orig_mesh, cutted_mesh, is_inserted_vert, orig_to_cutted, cutted_to_orig);
     };
     auto add_f = [&](Mesh::FaceHandle f)
     {
-        add_face(f, target_mesh, disk, is_inserted_face, tgt_to_disk);
+        add_face(f, orig_mesh, cutted_mesh, is_inserted_face, orig_to_cutted);
     };
 
     // Boundary vertices and faces
-    for (const auto &v : target_boundary_vertices)
+    for (const auto &v : seam_vertices)
     {
         is_visited[v] = true;
         add_v(v);
     }
-    for (int i = 0; i < target_boundary_vertices.size(); i++)
+    for (int i = 0; i < seam_vertices.size(); i++)
     {
-        int j = (i + 1) % target_boundary_vertices.size();
+        int j = (i + 1) % seam_vertices.size();
 
-        Mesh::VertexHandle fr = target_boundary_vertices[i];
-        Mesh::VertexHandle to = target_boundary_vertices[j];
-        auto he = target_mesh.find_halfedge(fr, to);
+        Mesh::VertexHandle fr = seam_vertices[i];
+        Mesh::VertexHandle to = seam_vertices[j];
+        auto he = orig_mesh.find_halfedge(fr, to);
         auto op = he.next().to();
 
         add_v(op);
@@ -456,7 +477,7 @@ void OptimalBoundaries::gen_disk_mesh()
         queue.pop();
 
         // Add adjacent vertices to the disk, and push unvisited vertices to the queue
-        for (const auto &v_a : target_mesh.vv_range(v))
+        for (const auto &v_a : orig_mesh.vv_range(v))
         {
             add_v(v_a);
             if (!is_visited[v_a])
@@ -467,79 +488,14 @@ void OptimalBoundaries::gen_disk_mesh()
         }
 
         // Add adjacent faces to the disk
-        for (const auto &f : target_mesh.vf_range(v))
+        for (const auto &f : orig_mesh.vf_range(v))
             add_f(f);
     }
 }
 
-void OptimalBoundaries::gen_disk_mesh_feat()
+void OptimalBoundaries::gen_disk_mesh()
 {
-    // Iterate through vertices in the disk with a modified breadth-first search
-    std::queue<Mesh::VertexHandle> queue;
-    OpenMesh::VProp<bool> is_visited(false, source_mesh);
-    OpenMesh::VProp<bool> is_inserted_vert(false, source_mesh);
-    OpenMesh::FProp<bool> is_inserted_face(false, source_mesh);
-
-    auto add_v = [&](Mesh::VertexHandle v)
-    {
-        add_vertex(v, source_mesh, disk_feat, is_inserted_vert, src_to_disk_feat, disk_feat_to_src);
-    };
-    auto add_f = [&](Mesh::FaceHandle f)
-    {
-        add_face(f, source_mesh, disk_feat, is_inserted_face, src_to_disk_feat);
-    };
-
-    std::vector<Mesh::VertexHandle> boundary = optimal_boundary;
-    for (auto &v : boundary)
-        v = band_to_orig[v];
-
-    // Boundary vertices and faces
-    for (const auto &v : boundary)
-    {
-        is_visited[v] = true;
-        add_v(v);
-    }
-    // for (int i = 0; i < boundary.size() - 1; i++)
-    for (int i = boundary.size() - 1; i > 0; i--)
-    {
-        int j = i - 1;
-
-        Mesh::VertexHandle fr = boundary[i];
-        Mesh::VertexHandle to = boundary[j];
-        auto he = source_mesh.find_halfedge(fr, to);
-        auto op = he.next().to();
-
-        add_v(op);
-        add_f(he.face());
-
-        if (!is_visited[op])
-        {
-            queue.push(op);
-            is_visited[op] = true;
-        }
-    }
-
-    // Iterate through the rest of the disk
-    while (!queue.empty())
-    {
-        Mesh::VertexHandle v = queue.front();
-        queue.pop();
-
-        // Add adjacent vertices to the disk, and push unvisited vertices to the queue
-        for (const auto &v_a : source_mesh.vv_range(v))
-        {
-            add_v(v_a);
-            if (!is_visited[v_a])
-            {
-                queue.push(v_a);
-                is_visited[v_a] = true;
-            }
-        }
-
-        // Add adjacent faces to the disk
-        for (const auto &f : source_mesh.vf_range(v))
-            add_f(f);
-    }
+    cut_mesh(target_mesh, disk, target_boundary_vertices, tgt_to_disk, disk_to_tgt);
 }
 
 void OptimalBoundaries::parameterize_source()
@@ -635,7 +591,7 @@ void OptimalBoundaries::find_optimal_boundary()
             band_edge_length_average += (band_points.row(j) - band_points.row(i)).norm();
             disk_edge_length_average += (disk_points.row(j) - disk_points.row(i)).norm();
         }
-        double s = disk_edge_length_average / band_edge_length_average;
+        s = disk_edge_length_average / band_edge_length_average;
         band_points *= s;
 
         // Calculate the centroid and move to origin to eliminate translation
@@ -648,6 +604,12 @@ void OptimalBoundaries::find_optimal_boundary()
         Eigen::Matrix3d H = band_points.transpose() * disk_points;
         Eigen::JacobiSVD<Eigen::Matrix3d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
         R = svd.matrixV() * svd.matrixU().transpose();
+        if (R.determinant() < 0.0)
+        {
+            Eigen::Matrix3d F = Eigen::Matrix3d::Identity();
+            F(2, 2) = -1.0;
+            R = svd.matrixV() * F * svd.matrixU().transpose();
+        }
 
         // Calculate the translation
         Eigen::Vector3d t = disk_centroid - R * band_centroid;
@@ -662,7 +624,7 @@ void OptimalBoundaries::find_optimal_boundary()
             auto fr = he.from(), to = he.to();
 
             Eigen::Vector3d band_edge = band.point(to) - band.point(fr);
-            band_edge *= s;
+            band_edge *= scale;
             Eigen::Vector3d disk_edge = band_to_disk[to].point - band_to_disk[fr].point;
 
             band_weight[e] = (R * band_edge - disk_edge).norm() * band_edge_length[e];
@@ -710,7 +672,7 @@ void OptimalBoundaries::find_optimal_boundary()
 
         for (auto v = v_target; v != v_start; v = dijkstra.get_previous(v))
             new_optimal_boundary.push_back(stripe_to_band[v]);
-        new_optimal_boundary.push_back(stripe_to_band[v_start]);
+        // new_optimal_boundary.push_back(stripe_to_band[v_start]);
 
         optimal_boundary = new_optimal_boundary;
         optimal_energy = min_cost;
@@ -720,6 +682,17 @@ void OptimalBoundaries::find_optimal_boundary()
 
         last_energy = optimal_energy;
     }
+
+    std::reverse(optimal_boundary.begin(), optimal_boundary.end());
+}
+
+void OptimalBoundaries::gen_disk_mesh_feat()
+{
+    std::vector<Mesh::VertexHandle> boundary = optimal_boundary;
+    for (auto &v : boundary)
+        v = band_to_orig[v];
+
+    cut_mesh(source_mesh, merged_mesh, boundary, orig_to_merged, merged_to_orig);
 }
 
 double opposite_angle(Mesh mesh, Mesh::HalfedgeHandle heh)
@@ -735,12 +708,12 @@ void OptimalBoundaries::poisson_mesh_merging()
 {
     // Compute cotangent laplacian for disk_feat
     std::vector<Eigen::Triplet<double>> triplets;
-    triplets.reserve(disk_feat.n_halfedges() * 4);
-    for (const auto &h : disk_feat.halfedges())
+    triplets.reserve(merged_mesh.n_halfedges() * 4);
+    for (const auto &h : merged_mesh.halfedges())
     {
         if (h.is_boundary())
             continue;
-        double cot = 1.0 / tan(opposite_angle(disk_feat, h));
+        double cot = 1.0 / tan(opposite_angle(merged_mesh, h));
 
         auto fr = h.from(), to = h.to();
         if (!fr.is_boundary())
@@ -754,41 +727,237 @@ void OptimalBoundaries::poisson_mesh_merging()
             triplets.push_back({to.idx(), fr.idx(), -cot});
         }
     }
-    for (const auto &v : disk_feat.vertices())
+    constexpr double lambda = 1.0;
+    for (const auto &v : merged_mesh.vertices())
         if (v.is_boundary())
-            triplets.push_back({v.idx(), v.idx(), 100.0});
-    Eigen::SparseMatrix<double> L(disk_feat.n_vertices(), disk_feat.n_vertices());
+            triplets.push_back({v.idx(), v.idx(), lambda});
+    Eigen::SparseMatrix<double> L(merged_mesh.n_vertices(), merged_mesh.n_vertices());
     L.setFromTriplets(triplets.begin(), triplets.end());
 
     // Compute b
-    Eigen::MatrixXd b(disk_feat.n_vertices(), 3);
+    Eigen::MatrixXd b(merged_mesh.n_vertices(), 3);
 
-    for (const auto &v : disk_feat.vertices())
-        b.row(v.idx()) = R * disk_feat.point(v);
-    // b.row(v.idx()) = Eigen::Vector3d::Zero();
+    for (const auto &v : merged_mesh.vertices())
+        b.row(v.idx()) = R * merged_mesh.point(v);
     b = L * b;
 
-    std::cout << std::endl;
-
-    for (const auto &v : disk_feat.vertices())
+    for (const auto &v : merged_mesh.vertices())
         if (v.is_boundary())
-        {
-            b.row(v.idx()) = band_to_disk[orig_to_band[disk_feat_to_src[v]]].point * 100.0;
-            std::cout << b.row(v.idx()).norm() << ' ';
-        }
+            b.row(v.idx()) = band_to_disk[orig_to_band[merged_to_orig[v]]].point * lambda;
 
     // Solve the linear system
-    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+    Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
     solver.compute(L);
-    merged_pos = solver.solve(b);
-
-    for (const auto &v : disk_feat.vertices())
-        if (v.is_boundary())
-        {
-            std::cout << merged_pos.row(v.idx()).norm() << ' ';
-        }
+    Eigen::MatrixXd merged_pos = solver.solve(b);
 
     // Update the positions
-    for (const auto &v : disk_feat.vertices())
-        disk_feat.set_point(v, merged_pos.row(v.idx()));
+    for (const auto &v : merged_mesh.vertices())
+        merged_mesh.set_point(v, merged_pos.row(v.idx()));
 }
+
+#include <Eigen/Dense>
+
+#include <Eigen/Dense>
+
+bool lineseg_overlap(const Eigen::Vector2d &x0, const Eigen::Vector2d &x1,
+                     const Eigen::Vector2d &y0, const Eigen::Vector2d &y1)
+{
+    auto direction = [](const Eigen::Vector2d &pi, const Eigen::Vector2d &pj, const Eigen::Vector2d &pk)
+    {
+        Eigen::Vector2d v1 = pj - pi;
+        Eigen::Vector2d v2 = pk - pi;
+        return v1.x() * v2.y() - v1.y() * v2.x(); // 2D cross product
+    };
+
+    auto on_segment = [](const Eigen::Vector2d &pi, const Eigen::Vector2d &pj, const Eigen::Vector2d &pk)
+    {
+        return (std::min(pi.x(), pj.x()) <= pk.x() && pk.x() <= std::max(pi.x(), pj.x()) &&
+                std::min(pi.y(), pj.y()) <= pk.y() && pk.y() <= std::max(pi.y(), pj.y()));
+    };
+
+    double d1 = direction(x0, x1, y0);
+    double d2 = direction(x0, x1, y1);
+    double d3 = direction(y0, y1, x0);
+    double d4 = direction(y0, y1, x1);
+
+    if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+        ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0)))
+    {
+        return true;
+    }
+
+    if (d1 == 0 && on_segment(x0, x1, y0))
+        return true;
+    if (d2 == 0 && on_segment(x0, x1, y1))
+        return true;
+    if (d3 == 0 && on_segment(y0, y1, x0))
+        return true;
+    if (d4 == 0 && on_segment(y0, y1, x1))
+        return true;
+
+    return false;
+}
+
+#pragma optimize("", off)
+
+void OptimalBoundaries::gen_merged_mesh()
+{
+    // Copy the rest part of the target mesh to the merged mesh
+    OpenMesh::FProp<bool> should_not_be_copied(false, disk);
+
+    // for (const auto &v : optimal_boundary)
+    // {
+    //     auto f = band_to_disk[v].face;
+    //     should_not_be_copied[f] = true;
+    // }
+
+    for (int i = 0; i < optimal_boundary.size(); i++)
+    {
+        int j = (i + 1) % optimal_boundary.size();
+
+        auto v0 = optimal_boundary[i];
+        auto v1 = optimal_boundary[j];
+
+        Eigen::Vector2d uv0 = band_uv.row(v0.idx());
+        Eigen::Vector2d uv1 = band_uv.row(v1.idx());
+
+        uv0 = offset + Eigen::Rotation2Dd(rotation).matrix() * scale * uv0;
+        uv1 = offset + Eigen::Rotation2Dd(rotation).matrix() * scale * uv1;
+
+        for (const auto &f : disk.faces())
+        {
+            auto v0 = f.halfedge().from();
+            auto v1 = f.halfedge().to();
+            auto v2 = f.halfedge().next().to();
+
+            Eigen::Vector2d uv_v0 = disk_uv.row(v0.idx());
+            Eigen::Vector2d uv_v1 = disk_uv.row(v1.idx());
+            Eigen::Vector2d uv_v2 = disk_uv.row(v2.idx());
+
+            if (lineseg_overlap(uv0, uv1, uv_v0, uv_v1) ||
+                lineseg_overlap(uv0, uv1, uv_v1, uv_v2) ||
+                lineseg_overlap(uv0, uv1, uv_v2, uv_v0))
+                should_not_be_copied[f] = true;
+        }
+    }
+
+    OpenMesh::VProp<Mesh::VertexHandle> tgt_to_merged(target_mesh), merged_to_tgt(merged_mesh);
+
+    std::vector<Mesh::VertexHandle> boundary = target_boundary_vertices;
+    std::reverse(boundary.begin(), boundary.end());
+    cut_mesh(target_mesh, merged_mesh, boundary, tgt_to_merged, merged_to_tgt);
+
+    auto add_face = [&](Mesh::FaceHandle f)
+    {
+        std::vector<Mesh::VertexHandle> vertices;
+        for (const auto &v : disk.fv_range(f))
+        {
+            if (!tgt_to_merged[disk_to_tgt[v]].is_valid())
+            {
+                auto new_v = merged_mesh.add_vertex(disk.point(v));
+                tgt_to_merged[disk_to_tgt[v]] = new_v;
+            }
+            vertices.push_back(tgt_to_merged[disk_to_tgt[v]]);
+        }
+        merged_mesh.add_face(vertices[0], vertices[1], vertices[2]);
+    };
+
+    std::queue<Mesh::FaceHandle> queue;
+    queue.push(disk.face_handle(0));
+    OpenMesh::FProp<bool> is_visited(false, disk);
+    is_visited[disk.face_handle(0)] = true;
+
+    add_face(disk.face_handle(0));
+
+    while (!queue.empty())
+    {
+        auto f = queue.front();
+        queue.pop();
+
+        for (const auto &f : disk.ff_ccw_range(f))
+        {
+            if (!is_visited[f] && !should_not_be_copied[f])
+            {
+                is_visited[f] = true;
+                queue.push(f);
+
+                add_face(f);
+            }
+        }
+    }
+
+    // Find the shortest pair from the boundary of the merged source mesh to the boundary of the cutted target mesh
+    std::vector<Mesh::VertexHandle> merged_boundary = optimal_boundary;
+    for (auto &v : merged_boundary)
+        v = orig_to_merged[band_to_orig[v]];
+
+    // std::vector<Mesh::VertexHandle> cutted_boundary = target_boundary_vertices;
+    // for (auto &v : cutted_boundary)
+    //     v = tgt_to_merged[v];
+
+    Mesh::VertexHandle cutted_boundary_v_start;
+    for (const auto &v : disk.vertices())
+    {
+        auto v_merged = tgt_to_merged[disk_to_tgt[v]];
+        if (v_merged.is_valid() && merged_mesh.is_boundary(v_merged))
+        {
+            cutted_boundary_v_start = v_merged;
+            break;
+        }
+    }
+
+    Mesh::HalfedgeHandle cutted_boundary_he_start;
+    for (const auto &he : merged_mesh.voh_range(cutted_boundary_v_start))
+        if (merged_mesh.is_boundary(he))
+        {
+            cutted_boundary_he_start = he;
+            break;
+        }
+
+    std::vector<Mesh::VertexHandle> cutted_boundary;
+    for (auto he = cutted_boundary_he_start;
+         merged_mesh.next_halfedge_handle(he) != cutted_boundary_he_start;
+         he = merged_mesh.next_halfedge_handle(he))
+        cutted_boundary.push_back(merged_mesh.to_vertex_handle(he));
+    cutted_boundary.push_back(merged_mesh.from_vertex_handle(cutted_boundary_he_start));
+
+    double min_distance = infd;
+    int i, j, min_i, min_j;
+    for (i = 0; i < merged_boundary.size(); i++)
+    {
+        auto v0 = merged_boundary[i];
+        for (j = 0; j < cutted_boundary.size(); j++)
+        {
+            auto v1 = cutted_boundary[j];
+            double d = (merged_mesh.point(v0) - merged_mesh.point(v1)).norm();
+            if (d < min_distance)
+            {
+                min_distance = d;
+                min_i = i;
+                min_j = j;
+            }
+        }
+    }
+
+    Mesh::VertexHandle v0 = merged_boundary[min_i],
+                       v1 = cutted_boundary[min_j],
+                       v2 = merged_boundary[(min_i + 1) % merged_boundary.size()],
+                       v3 = cutted_boundary[(min_j + 1) % cutted_boundary.size()];
+    merged_mesh.add_face(v0, v1, v2);
+    merged_mesh.add_face(v1, v3, v2);
+
+    // Fill in the hole
+    std::vector<Mesh::VertexHandle> hole_boundary;
+    hole_boundary.reserve(merged_boundary.size() + cutted_boundary.size());
+    // v2, ...(boundary vertices of the merged mesh), v0
+    for (int i = (min_i + 1) % merged_boundary.size(); i != min_i; i = (i + 1) % merged_boundary.size())
+        hole_boundary.push_back(merged_boundary[i]);
+    hole_boundary.push_back(v0);
+    // v1, ...(boundary vertices of the cutted mesh), v3
+    for (int i = min_j; i != (min_j + 1) % cutted_boundary.size(); i = (i - 1 + cutted_boundary.size()) % cutted_boundary.size())
+        hole_boundary.push_back(cutted_boundary[i]);
+    hole_boundary.push_back(v3);
+
+    mesh_completion(merged_mesh, hole_boundary);
+}
+#pragma optimize("", on)

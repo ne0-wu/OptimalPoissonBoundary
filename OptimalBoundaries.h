@@ -34,7 +34,7 @@ public:
     auto &get_optimal_boundary() { return optimal_boundary; }
     double get_optimal_energy() { return optimal_energy; }
 
-    Mesh &get_merged_mesh() { return disk_feat; }
+    Mesh &get_merged_mesh() { return merged_mesh; }
 
 private:
     const Mesh &source_mesh;
@@ -78,10 +78,9 @@ private:
     OpenMesh::VProp<Mesh::VertexHandle> tgt_to_disk; // Mapping from band vertices to disk vertices
     Eigen::MatrixXd disk_uv;
 
-    Mesh disk_feat;
-    OpenMesh::VProp<Mesh::VertexHandle> disk_feat_to_src;
-    OpenMesh::VProp<Mesh::VertexHandle> src_to_disk_feat;
-    Eigen::MatrixXd merged_pos;
+    Mesh merged_mesh;
+    OpenMesh::VProp<Mesh::VertexHandle> merged_to_orig;
+    OpenMesh::VProp<Mesh::VertexHandle> orig_to_merged;
 
     // parameterization bindings
     double scale;
@@ -118,16 +117,22 @@ private:
     // Find the face in the target mesh that contains the point, in the UV domain
     PointQuery disk_rasterization(Eigen::Vector2d point);
 
-    Eigen::Matrix3d R;
-
     // Update the query of each vertex in the band mesh
     void update_band_to_disk();
 
     // Main algorithm
     // ==================================================
+    Eigen::Matrix3d R;
+    double s;
+
     void find_optimal_boundary();
 
     // Poisson mesh merging
     // ==================================================
+
+    // Compute vertex positions for the merged mesh
     void poisson_mesh_merging();
+
+    // Merge the meshes
+    void gen_merged_mesh();
 };

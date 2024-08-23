@@ -161,9 +161,10 @@ int main()
         bool wireframe_on = true;
         bool add_vertex = true;
         bool render_loop_end = false;
+        bool binding_confirmed = false;
 
         // control flags
-        bool load_boundary_from_file = true;
+        bool load_boundary_from_file = false;
     } flags;
 
     // Initialize window (and OpenGL context)
@@ -185,7 +186,7 @@ int main()
     Mesh source_mesh, target_mesh;
     try
     {
-        OpenMesh::IO::read_mesh(source_mesh, "data/models/camelhead.obj");
+        OpenMesh::IO::read_mesh(source_mesh, "data/models/max-planck.obj");
         OpenMesh::IO::read_mesh(target_mesh, "data/models/ball.obj");
     }
     catch (const std::exception &e)
@@ -563,6 +564,8 @@ int main()
 
         if (ImGui::Button("Confirm Binding"))
         {
+            flags.binding_confirmed = true;
+
             ob.set_para_bindings(para_binding.scale, para_binding.rotation_angle / 180.0 * M_PI,
                                  {para_binding.offset_x, para_binding.offset_y});
             ob.run();
@@ -586,8 +589,13 @@ int main()
             logger.log("Optimal boundary vertices: {}", optimal_boundary_str);
         }
 
-        if (ImGui::Button("Proceed"))
-            flags.render_loop_end = true;
+        if (flags.binding_confirmed)
+        {
+            ImGui::Text("Optimal energy: %f", ob.get_optimal_energy());
+            ImGui::Text("Optimal boundary vertices: %d", optimal_boundary.size());
+            if (ImGui::Button("Proceed"))
+                flags.render_loop_end = true;
+        }
 
         ImGui::End();
 
@@ -693,13 +701,13 @@ int main()
         // draw the mesh
         basic.use();
 
-        if (flags.wireframe_on)
-        {
-            basic.set_uniform("color", glm::vec4(0.5f, 0.95f, 0.5f, 0.95f));
-            gl_mesh_tgt.draw_wireframe();
-        }
-        basic.set_uniform("color", glm::vec4(0.5f, 0.2f, 1.0f, 0.2f));
-        gl_mesh_tgt.draw();
+        // if (flags.wireframe_on)
+        // {
+        //     basic.set_uniform("color", glm::vec4(0.5f, 0.95f, 0.5f, 0.95f));
+        //     gl_mesh_tgt.draw_wireframe();
+        // }
+        // basic.set_uniform("color", glm::vec4(0.5f, 0.2f, 1.0f, 0.2f));
+        // gl_mesh_tgt.draw();
 
         if (flags.wireframe_on)
         {
